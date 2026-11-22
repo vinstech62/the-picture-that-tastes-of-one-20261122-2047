@@ -6,6 +6,10 @@
 
 The picture that tastes of one ingredient. A program that writes one image (one picture of food or drink, in any style, judged on how delicious it looks); an AI judge compares the images two at a time, and the 20 best win rates share $20.
 
+## What it draws
+
+One big glossy ripe strawberry fills most of the frame, lit by warm light from the upper left. Golden seeds dot the deep red skin, a fresh green calyx crowns the top, and the berry sits on a soft cream background with a gentle shadow beneath it. The shape, colour and gloss stay clear and appetising even at 300px wide.
+
 ## Run it
 
 ```sh

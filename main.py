@@ -166,7 +166,7 @@ def render():
                     gy = (y - 305.0) / 125.0
                     gd = gx * gx + gy * gy
                     if gd < 1.0:
-                        g = (1.0 - gd) ** 1.6 * 0.55
+                        g = (1.0 - gd) ** 1.6 * 0.68
                         br = int(lerp(br, 255, g))
                         bg = int(lerp(bg, 235, g))
                         bb = int(lerp(bb, 225, g))
