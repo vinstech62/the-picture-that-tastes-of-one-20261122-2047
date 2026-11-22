@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Procedural strawberry: one glossy ripe strawberry on warm cream.
+"""One glossy strawberry, drawn pixel by pixel with the standard library.
 
-Stdlib only. Writes a deterministic 1024x1024 PNG to /output/entry.png
-(or $ENTRY_OUTPUT). No network, no assets, fixed seed, no timestamps.
+Writes a single 1024x1024 PNG to /output/entry.png (or $ENTRY_OUTPUT).
+No assets, no network, fully deterministic: every pixel is a pure
+function of its coordinates, so repeated runs are byte-identical.
 """
 
 import math
@@ -10,212 +11,231 @@ import os
 import struct
 import zlib
 
-W = 1024
-H = 1024
+SIZE = 1024
+OUTPUT = os.environ.get("ENTRY_OUTPUT", "/output/entry.png")
 
-# --- palette -------------------------------------------------------------
-BG_CENTRE = (255, 246, 230)
-BG_EDGE = (238, 214, 176)
-RED_TOP = (238, 64, 52)
-RED_BOTTOM = (168, 12, 30)
-RED_EDGE = (140, 8, 24)
-SEED = (250, 214, 130)
-SEED_DARK = (196, 148, 64)
-LEAF = (74, 148, 58)
-LEAF_DARK = (38, 102, 34)
-LEAF_LIGHT = (120, 190, 96)
-SHADOW = (120, 84, 48)
-
-
-def clamp(v, lo=0, hi=255):
-    return lo if v < lo else hi if v > hi else v
-
-
-def lerp(a, b, t):
-    return a + (b - a) * t
-
-
-def blend(c1, c2, t):
-    return (clamp(int(lerp(c1[0], c2[0], t))),
-            clamp(int(lerp(c1[1], c2[1], t))),
-            clamp(int(lerp(c1[2], c2[2], t))))
-
-
-# --- strawberry outline --------------------------------------------------
-TOP = 168.0
-BOTTOM = 884.0
+# ---- berry geometry -----------------------------------------------------
 CX = 512.0
+TOP = 205.0
+BOT = 942.0
+HALF_W = 330.0
+
+# ---- palette ------------------------------------------------------------
+BG_CENTER = (255, 246, 232)
+BG_EDGE = (240, 216, 178)
+SHADOW_RGB = (112, 82, 50)
+RED_TOP = (224, 54, 50)
+RED_MID = (199, 30, 38)
+RED_DEEP = (148, 15, 27)
+GLOSS_RGB = (255, 148, 108)
+SEED_RGB = (247, 217, 134)
+SEED_SHADE = (118, 15, 21)
+LEAF_BASE = (46, 118, 52)
+LEAF_TIP = (96, 178, 88)
+LEAF_VEIN = (150, 205, 120)
 
 
-def half_width(y):
-    """Half-width of the berry at row y (0 outside the berry)."""
-    if y < TOP or y > BOTTOM:
-        return 0.0
-    s = (y - TOP) / (BOTTOM - TOP)
-    return 332.0 * (math.sin(math.pi * (0.02 + 0.98 * s)) ** 0.8)
+def clamp01(v):
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
 
-# --- achenes (seeds): staggered rows -------------------------------------
-SEEDS = []
-_y = 300
-_row = 0
-while _y < 830:
-    _x = 300 if _row % 2 == 0 else 330
-    while _x < 730:
-        SEEDS.append((_x, _y))
-        _x += 62
-    _y += 56
-    _row += 1
-
-SEED_ROWS = [[] for _ in range(H)]
-for _sx, _sy in SEEDS:
-    _hw = half_width(_sy)
-    if _hw <= 0 or abs(_sx - CX) > _hw - 26:
-        continue
-    for _yy in range(_sy - 7, _sy + 8):
-        if 0 <= _yy < H:
-            _dy = (_yy - _sy) / 7.0
-            _rx = 5.0 * math.sqrt(max(0.0, 1.0 - _dy * _dy))
-            SEED_ROWS[_yy].append((_sx - _rx, _sx + _rx, _sy))
+def smoothstep(a, b, x):
+    t = clamp01((x - a) / (b - a))
+    return t * t * (3.0 - 2.0 * t)
 
 
-# --- calyx: five pointed leaves fanning from the crown -------------------
-def _leaf_spans(cx, cy, length, width, angle_deg):
-    """Per-row x-intervals of a rotated ellipse (a pointed leaf)."""
-    spans = {}
-    ang = math.radians(angle_deg)
-    ca, sa = math.cos(ang), math.sin(ang)
-    for yy in range(int(cy - length), int(cy + length) + 1):
-        if not 0 <= yy < H:
-            continue
-        best = None
-        for k in range(-100, 101):
-            t = k / 100.0
-            lx = cx + t * length * ca
-            ly = cy + t * length * sa
-            if abs(ly - yy) < 1.0:
-                w = width * math.sqrt(max(0.0, 1.0 - t * t))
-                lo, hi = lx - w, lx + w
-                best = (lo, hi) if best is None else (min(best[0], lo), max(best[1], hi))
-        if best is not None:
-            spans[yy] = best
-    return spans
+def mix(c1, c2, t):
+    return (c1[0] + (c2[0] - c1[0]) * t,
+            c1[1] + (c2[1] - c1[1]) * t,
+            c1[2] + (c2[2] - c1[2]) * t)
 
 
-LEAF_ROWS = [[] for _ in range(H)]
-_LEAVES = [
-    (512, 178, 96, 26, -90),   # centre leaf, pointing up
-    (512, 186, 92, 24, -138),  # upper left
-    (512, 186, 92, 24, -42),   # upper right
-    (512, 196, 82, 22, -165),  # left
-    (512, 196, 82, 22, -15),   # right
+def body_half_width(t):
+    """Half-width of the berry at normalised height t (0 top, 1 point).
+
+    Plump upper body: full width holds through the shoulders, then the
+    sides curve in steeply toward the point at the bottom.
+    """
+    shoulder = 1.0 - smoothstep(0.30, 1.0, t) ** 1.2
+    top_round = 0.78 + 0.22 * smoothstep(0.0, 0.12, t)
+    return HALF_W * shoulder * top_round
+
+
+# ---- calyx leaves: (angle from straight up, length, half width) ---------
+LEAVES = [
+    (-72.0, 148.0, 30.0),
+    (-36.0, 166.0, 34.0),
+    (0.0, 182.0, 36.0),
+    (36.0, 166.0, 34.0),
+    (72.0, 148.0, 30.0),
 ]
-for _cx, _cy, _ln, _wd, _an in _LEAVES:
-    for _yy, (_lo, _hi) in _leaf_spans(_cx, _cy, _ln, _wd, _an).items():
-        LEAF_ROWS[_yy].append((_lo, _hi))
+LEAF_BASE_PT = (512.0, 222.0)
+LEAF_TRIG = [(math.sin(math.radians(a)), math.cos(math.radians(a)), ln, wd)
+             for (a, ln, wd) in LEAVES]
 
 
-# --- render ---------------------------------------------------------------
-def render():
-    dx2 = [(x - 512.0) ** 2 for x in range(W)]
-    img = bytearray(W * H * 3)
-    sqrt = math.sqrt
-    for y in range(H):
-        dy = y - 470.0
-        dy2 = dy * dy
-        hw = half_width(y)
-        row = y * W * 3
-        seeds = SEED_ROWS[y]
-        leaves = LEAF_ROWS[y]
-        # ground shadow: soft ellipse under the berry
-        sh_dy = (y - 905.0) / 34.0
-        sh_ok = abs(sh_dy) < 1.0
-        for x in range(W):
-            i = row + x * 3
-            r = sqrt(dx2[x] + dy2)
-            t = min(1.0, r / 950.0)
-            cr = int(lerp(BG_CENTRE[0], BG_EDGE[0], t))
-            cg = int(lerp(BG_CENTRE[1], BG_EDGE[1], t))
-            cb = int(lerp(BG_CENTRE[2], BG_EDGE[2], t))
-            if sh_ok:
-                sh_dx = (x - 512.0) / 330.0
-                sh = 1.0 - (sh_dx * sh_dx + sh_dy * sh_dy)
-                if sh > 0.0:
-                    a = 0.30 * sh
-                    cr = int(lerp(cr, SHADOW[0], a))
-                    cg = int(lerp(cg, SHADOW[1], a))
-                    cb = int(lerp(cb, SHADOW[2], a))
-            if hw > 0.0:
-                dx = (x - CX) / hw
-                if abs(dx) < 1.0:
-                    s = (y - TOP) / (BOTTOM - TOP)
-                    # vertical red gradient + darker rim at the edges
-                    br = int(lerp(RED_TOP[0], RED_BOTTOM[0], s))
-                    bg = int(lerp(RED_TOP[1], RED_BOTTOM[1], s))
-                    bb = int(lerp(RED_TOP[2], RED_BOTTOM[2], s))
-                    edge = abs(dx) ** 2.4
-                    br = int(lerp(br, RED_EDGE[0], edge * 0.55))
-                    bg = int(lerp(bg, RED_EDGE[1], edge * 0.55))
-                    bb = int(lerp(bb, RED_EDGE[2], edge * 0.55))
-                    # warm light from upper left
-                    warm = max(0.0, 1.0 - ((x - 380.0) ** 2 + (y - 300.0) ** 2) / 420000.0)
-                    br = clamp(br + int(26 * warm))
-                    bg = clamp(bg + int(10 * warm))
-                    # gloss highlight on the upper-left shoulder
-                    gx = (x - 400.0) / 185.0
-                    gy = (y - 305.0) / 125.0
-                    gd = gx * gx + gy * gy
-                    if gd < 1.0:
-                        g = (1.0 - gd) ** 1.6 * 0.68
-                        br = int(lerp(br, 255, g))
-                        bg = int(lerp(bg, 235, g))
-                        bb = int(lerp(bb, 225, g))
-                    cr, cg, cb = br, bg, bb
-                    # achene (seed) in this row?
-                    for slo, shi, ssy in seeds:
-                        if slo <= x <= shi:
-                            dseed = abs(y - ssy) / 7.0
-                            cr, cg, cb = SEED if dseed < 0.55 else SEED_DARK
-                            break
-            # calyx leaves drawn over the top of the berry
-            for llo, lhi in leaves:
-                if llo <= x <= lhi:
-                    lt = min(1.0, (x - llo) / max(1.0, (lhi - llo)))
-                    cr, cg, cb = blend(LEAF_DARK, LEAF_LIGHT, 0.35 + 0.5 * lt)
-                    break
-            img[i] = cr
-            img[i + 1] = cg
-            img[i + 2] = cb
-    return img
+def leaf_profile(s, length, half_w):
+    u = s / length
+    if u <= 0.0 or u >= 1.0:
+        return 0.0
+    return half_w * (math.sin(math.pi * u ** 0.9) ** 0.7)
 
 
-def write_png(path, img):
+# ---- achene (seed) rows --------------------------------------------------
+# Each row: (centre y, first seed x, seed count). Seeds sit in staggered
+# rows, only where the berry is wide enough to hold them.
+SEED_ROWS = []
+for _r in range(10):
+    _ys = 300.0 + _r * 60.0
+    _t = (_ys - TOP) / (BOT - TOP)
+    _hw = body_half_width(_t)
+    _stag = 34.0 if _r % 2 else 0.0
+    _x0 = CX - _hw + 42.0 + _stag
+    _x1 = CX + _hw - 42.0
+    _n = int((_x1 - _x0) / 68.0) + 1
+    if _n > 0:
+        SEED_ROWS.append((_ys, _x0, _n))
+
+
+def render_row(y):
+    out = bytearray()
+    # seed row that can affect this scanline (at most one: rows are 60 apart)
+    seed = None
+    sr = int(round((y - 300.0) / 60.0))
+    if 0 <= sr < len(SEED_ROWS):
+        ys, x0, n = SEED_ROWS[sr]
+        if abs(y - ys) <= 18.0:
+            seed = (ys, x0, n)
+    in_body = TOP - 2.0 <= y <= BOT
+    if in_body:
+        t = (y - TOP) / (BOT - TOP)
+        if t < 0.0:
+            t = 0.0
+        elif t > 1.0:
+            t = 1.0
+        hw = body_half_width(t)
+    else:
+        t = 0.0
+        hw = 0.0
+    in_leaf = 38 <= y <= 234
+    in_stem = 96 <= y <= 222
+    for x in range(SIZE):
+        # warm cream radial background
+        dx = x - 512.0
+        dy = y - 430.0
+        d = math.sqrt(dx * dx + dy * dy) / 700.0
+        r, g, b = mix(BG_CENTER, BG_EDGE, smoothstep(0.08, 1.0, d))
+        # soft ground shadow under the berry
+        qx = dx / 330.0
+        qy = (y - 958.0) / 30.0
+        q = qx * qx + qy * qy
+        if q < 1.0:
+            f = (1.0 - q) ** 1.5 * 0.20
+            r = r + (SHADOW_RGB[0] - r) * f
+            g = g + (SHADOW_RGB[1] - g) * f
+            b = b + (SHADOW_RGB[2] - b) * f
+        # berry body
+        if in_body:
+            ax = abs(x - CX)
+            if ax <= hw + 1.5:
+                if t < 0.45:
+                    base = mix(RED_TOP, RED_MID, t / 0.45)
+                else:
+                    base = mix(RED_MID, RED_DEEP, (t - 0.45) / 0.55)
+                u = (x - CX) / hw if hw > 0.0 else 0.0
+                edge = u * u
+                dark = 1.0 - 0.30 * edge ** 1.5
+                if dark < 0.0:
+                    dark = 0.0
+                base = (base[0] * dark, base[1] * dark, base[2] * dark)
+                # warm gloss on the upper-left shoulder
+                gx = (x - 400.0) / 380.0
+                gy = (y - 320.0) / 380.0
+                glow = 1.0 - (gx * gx + gy * gy)
+                if glow > 0.0:
+                    base = mix(base, GLOSS_RGB, glow * 0.55)
+                # achenes
+                if seed is not None:
+                    ys, x0, n = seed
+                    k = int(round((x - x0) / 68.0))
+                    if 0 <= k < n:
+                        xs = x0 + k * 68.0
+                        sdx = (x - xs) / 11.0
+                        sdy = (y - ys) / 15.0
+                        sd = math.sqrt(sdx * sdx + sdy * sdy)
+                        if sd < 1.2:
+                            cov = clamp01((1.15 - sd) / 0.30)
+                            base = mix(base, SEED_RGB, cov)
+                        else:
+                            sdx2 = (x - xs) / 14.0
+                            sdy2 = (y - ys - 4.0) / 18.0
+                            sd2 = math.sqrt(sdx2 * sdx2 + sdy2 * sdy2)
+                            if sd2 < 1.0:
+                                base = mix(base, SEED_SHADE, 0.45 * (1.0 - sd2))
+                # antialiased body edge
+                cov = clamp01(0.5 + (hw - ax) / 2.0)
+                r = base[0] * cov + r * (1.0 - cov)
+                g = base[1] * cov + g * (1.0 - cov)
+                b = base[2] * cov + b * (1.0 - cov)
+        # stem rising behind the calyx
+        if in_stem:
+            scx = 512.0 + (y - 222.0) * 0.05
+            if abs(x - scx) <= 7.0:
+                f = clamp01((222.0 - y) / 126.0)
+                r, g, b = mix((70.0, 60.0, 34.0), (126.0, 108.0, 62.0), f)
+        # calyx leaves on top
+        if in_leaf:
+            dxl = x - LEAF_BASE_PT[0]
+            dyl = y - LEAF_BASE_PT[1]
+            for sa, ca, length, half_w in LEAF_TRIG:
+                s = dxl * sa - dyl * ca
+                if 0.0 < s < length:
+                    w = dxl * ca + dyl * sa
+                    prof = leaf_profile(s, length, half_w)
+                    aw = abs(w)
+                    if aw < prof + 1.5:
+                        leaf = mix(LEAF_BASE, LEAF_TIP, smoothstep(0.0, 0.75, s / length))
+                        if aw < 3.0 and 8.0 < s < length - 12.0:
+                            leaf = mix(leaf, LEAF_VEIN, 0.75)
+                        ratio = aw / prof if prof > 0.0 else 0.0
+                        if ratio > 1.0:
+                            ratio = 1.0
+                        leaf = tuple(c * (1.0 - 0.18 * ratio * ratio) for c in leaf)
+                        cov = clamp01((prof - aw) / 2.0 + 0.5)
+                        r = leaf[0] * cov + r * (1.0 - cov)
+                        g = leaf[1] * cov + g * (1.0 - cov)
+                        b = leaf[2] * cov + b * (1.0 - cov)
+                        break
+        out.append(max(0, min(255, int(r))))
+        out.append(max(0, min(255, int(g))))
+        out.append(max(0, min(255, int(b))))
+    return out
+
+
+def render_png():
     raw = bytearray()
-    stride = W * 3
-    for y in range(H):
-        raw.append(0)  # filter: None
-        raw += img[y * stride:(y + 1) * stride]
-    comp = zlib.compress(bytes(raw), 9)
+    for y in range(SIZE):
+        raw.append(0)  # filter: none
+        raw.extend(render_row(y))
 
     def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        return (struct.pack(">I", len(data)) + tag + data +
+                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
-    png = b"\x89PNG\r\n\x1a\n"
-    png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
-    png += chunk(b"IDAT", comp)
-    png += chunk(b"IEND", b"")
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(png)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", SIZE, SIZE, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+            + chunk(b"IEND", b""))
 
 
 def main():
-    out = os.environ.get("ENTRY_OUTPUT", "/output/entry.png")
-    write_png(out, render())
-    print("wrote", out)
+    png = render_png()
+    parent = os.path.dirname(OUTPUT)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(OUTPUT, "wb") as f:
+        f.write(png)
+    print(f"wrote {OUTPUT}: {len(png)} bytes")
 
 
 if __name__ == "__main__":
